@@ -1,0 +1,115 @@
+#!/bin/sh
+# shellcheck disable=SC2015,SC2039,SC2046,SC2086,SC2166,SC3043
+TEMP_D=""
+stderr() { echo "$@" 1>&2; }
+fail() { local r=$?;  [ $r -eq 0 ] && r=1; failrc "$r" "$@"; }
+failrc() { local r=$1; shift; [ $# -eq 0 ] || stderr "$@"; exit $r; }
+
+cleanup() {
+    [ -z "$TEMP_D" ] || rm -Rf "$TEMP_D"
+}
+
+bad_Usage() { Usage 1>&2; [ $# -eq 0 ] || stderr "$@"; return 1; }
+Usage() {
+    cat <<EOF
+${0##*/} [disk-image]
+
+   execute qemu uefi, booting from disk-image.
+
+   --secure=[true|false]    boot secureboot or not.  Default is secureboot.
+EOF
+}
+
+cleanup() {
+    [ -z "${TEMP_D}" -o ! -d "${TEMP_D}" ] || rm -Rf "${TEMP_D}"
+}
+
+imgtype() {
+    local img="$1" out="" itype=""
+    out=$(qemu-img info "$img") || {
+        stderr "$img: failed to get qemu-img info"
+        return 1
+    }
+    itype=$(echo "$out" | awk '$0 ~ /file format:/ { print $3 }') || {
+        stderr "failed awk to read qemu-img output"
+        return 1
+    }
+    echo "$itype"
+}
+
+main() {
+    local o="" sopts="h"
+    local lopts="help,secure:"
+    o=$(getopt "--name=${0##*/}" "--options=$sopts" "--long=$lopts" -- "$@") &&
+        eval set -- "$o" || { bad_Usage; return; }
+
+    local cur="" next="" secure=true
+    while [ $# -ne 0 ]; do
+        cur="$1"; next="$2";
+        case "$cur" in
+            -h|--help) Usage ; exit 0;;
+               --secure) secure=$next; shift;;
+            --) shift; break;;
+        esac
+        shift;
+    done
+
+    TEMP_D=$(mktemp -d "${TMPDIR:-/tmp}/${0##*/}.XXXXXX") ||
+        fail "failed to make tempdir"
+    trap cleanup EXIT
+
+    local img="$1" imgfp="" ovmfbase="" code="" vars="" rund="" myd="" 
+    local bootdisk="" itype=""
+
+    rund="${TEMP_D}/run"
+    mkdir "$rund" || fail "failed to make run dir"
+
+    if [ -n "$img" ]; then
+        [ -f "$img" ] || fail "disk '$img': not a file"
+        imgfp=$(readlink -f "$img") || fail "failed to get full path to $img"
+        itype=$(imgtype "$imgfp") ||
+            fail "failed to read image type from $imgfp"
+        bootdisk="$rund/disk.qcow2"
+
+        # create a qcow backed by the input file.
+        # This means we don't change it and is sort of a "fast copy"
+        qemu-img create -F "$itype" -f qcow2 -b "$imgfp" "$bootdisk" ||
+            fail "failed to create qcow image for $imgfp"
+    fi
+
+    myd="$PWD"
+    case "$secure" in
+        true) ovmfbase="$myd/ovmf-secure";;
+        false) ovmfbase="$myd/ovmf-insecure";;
+        *) bad_Usage "Secure should be true or false. Found '$secure'"; return;;
+    esac
+
+    code="$ovmfbase-code.fd"
+    vars="$rund/ovmf-vars.fd"
+    [ -f "$code" ] || fail "ovmf code file '$code': not a file"
+    cp "$ovmfbase-vars.fd" "$vars" ||
+        fail "Failed to copy $ovmfbase-vars.fd to rundir"
+
+    # other useful flags:
+    #  -device VGA -vnc :9000
+    #   -object rng-random,filename=/dev/urandom,id=rng0 \
+    #   -device virtio-rng-pci,rng=rng0 \
+    #
+    set -- qemu-system-x86_64 \
+        -M pc-q35-focal,smm=on -m 256 -serial mon:stdio \
+        -global ICH9-LPC.disable_s3=1 \
+        -vnc none \
+        -nic none \
+        -drive "if=pflash,format=raw,file=$code,readonly=on" \
+        -drive "if=pflash,format=raw,file=$vars" \
+
+    [ -n "$bootdisk" ] &&
+        set -- "$@" \
+            -drive "file=$bootdisk,id=disk00,if=none,format=qcow2,index=0" \
+            -device "virtio-blk,drive=disk00,serial=${bootdisk##*/}"
+
+    stderr "executing:" "$@"
+    "$@"
+}
+
+main "$@"

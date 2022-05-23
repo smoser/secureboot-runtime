@@ -1,0 +1,4 @@
+release: focal
+packages:
+  ovmf: "0~20191122.bd85bf54-2ubuntu3.3"
+  shim-signed: "1.40.7+15.4-0ubuntu9"
